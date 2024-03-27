@@ -446,6 +446,33 @@ impl Consensus {
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
+        let tick_period = Duration::from_millis(self.config.tick_period_ms);
+
+        let mut previous_tick = Instant::now();
+
+        loop {
+            let mut elapsed = Instant::now().duration_since(previous_tick);
+            let mut timeout = tick_period.saturating_sub(elapsed);
+
+            while timeout > Duration::ZERO {
+                self.propose_updates(timeout)?;
+
+                elapsed = Instant::now().duration_since(previous_tick);
+                timeout = tick_period.saturating_sub(elapsed);
+            }
+
+            while elapsed > tick_period {
+                self.node.tick();
+
+                elapsed -= tick_period;
+                previous_tick += tick_period;
+            }
+
+            if self.node.has_ready() {
+                self.on_ready()?;
+            }
+        }
+
         let mut t = Instant::now();
         let mut timeout = Duration::from_millis(self.config.tick_period_ms);
 
