@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, Context as _};
 use api::grpc::dynamic_channel_pool::make_grpc_channel;
 use api::grpc::qdrant::raft_client::RaftClient;
 use api::grpc::qdrant::{AllPeers, PeerId as GrpcPeerId, RaftMessage as GrpcRaftMessage};
@@ -451,72 +451,38 @@ impl Consensus {
         let mut previous_tick = Instant::now();
 
         loop {
-            let mut state_updated = false;
+            let mut elapsed = previous_tick.elapsed();
 
-            let mut elapsed = Instant::now().duration_since(previous_tick);
-            let mut until_next_tick = tick_period.saturating_sub(elapsed);
+            if !self
+                .try_promote_learner()
+                .context("failed to promote learner")?
+            {
+                let mut proposed = 0;
+                let mut timeout = tick_period.saturating_sub(elapsed);
 
-            while until_next_tick > Duration::ZERO {
-                let timeout = if !state_updated {
-                    until_next_tick
-                } else {
-                    Duration::ZERO
-                };
+                while elapsed < tick_period && proposed < 32 && self.propose_updates(timeout)? {
+                    elapsed = previous_tick.elapsed();
 
-                state_updated = self.propose_updates(timeout)?;
-
-                elapsed = Instant::now().duration_since(previous_tick);
-                until_next_tick = tick_period.saturating_sub(elapsed);
-
-                if !state_updated {
-                    break;
+                    proposed += 1;
+                    timeout = tick_period / 10;
                 }
             }
 
             while elapsed > tick_period {
                 self.node.tick();
 
-                elapsed -= tick_period;
                 previous_tick += tick_period;
+                elapsed -= tick_period;
             }
 
             if self.node.has_ready() {
-                self.on_ready()?;
-            }
-        }
+                let stop_consensus = self.on_ready()?;
 
-        let mut t = Instant::now();
-        let mut timeout = Duration::from_millis(self.config.tick_period_ms);
-
-        loop {
-            if !self
-                .try_promote_learner()
-                .map_err(|err| anyhow!("Failed to promote learner: {}", err))?
-            {
-                // If learner promotion was proposed - do not add other proposals.
-                let have_changes = self.propose_updates(timeout)?;
-                if !have_changes {
-                    self.try_sync_local_state()?;
-                }
-            }
-            let d = t.elapsed();
-            t = Instant::now();
-            if d >= timeout {
-                timeout = Duration::from_millis(self.config.tick_period_ms);
-                // We drive Raft every `tick_period_ms`.
-                self.node.tick();
-                // Try to reapply entries if some were not applied due to errors.
-                let store = self.node.store().clone();
-                let stop_consensus = store.apply_entries(&mut self.node)?;
                 if stop_consensus {
                     return Ok(());
                 }
             } else {
-                timeout -= d;
-            }
-            let stop_consensus = self.on_ready()?;
-            if stop_consensus {
-                return Ok(());
+                self.try_sync_local_state()?;
             }
         }
     }
@@ -623,30 +589,37 @@ impl Consensus {
     /// Promotions are done by leader and only after it has no pending entries,
     /// that guarantees that learner will start voting only after it applies all the changes in the log
     fn try_promote_learner(&mut self) -> anyhow::Result<bool> {
+        // Promote only if leader
+        if self.node.status().ss.raft_state != StateRole::Leader {
+            return Ok(false);
+        }
+
+        // Promote only when there are no uncommitted changes.
+        let store = self.node.store();
+        let commit = store.hard_state().commit;
+        let last_log_entry = store.last_index()?;
+
+        if commit != last_log_entry {
+            return Ok(false);
+        }
+
         let learner = if let Some(learner) = self.find_learner_to_promote() {
             learner
         } else {
             return Ok(false);
         };
-        let store = self.node.store();
-        let commit = store.hard_state().commit;
-        let last_log_entry = store.last_index()?;
-        // Promote only when there are no uncommitted changes.
-        if commit != last_log_entry {
-            return Ok(false);
-        }
-        let status = self.node.status();
-        // Promote only if leader
-        if status.ss.raft_state != StateRole::Leader {
-            return Ok(false);
-        }
+
+        log::debug!("Proposing promotion for learner {learner} to voter");
+
         let mut change = ConfChangeV2::default();
+
         change.set_changes(vec![raft_proto::new_conf_change_single(
             learner,
             ConfChangeType::AddNode,
         )]);
-        log::debug!("Proposing promotion for learner {learner} to voter");
+
         self.node.propose_conf_change(vec![], change)?;
+
         Ok(true)
     }
 
