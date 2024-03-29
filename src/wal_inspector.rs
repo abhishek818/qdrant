@@ -1,8 +1,12 @@
-use std::env;
 use std::path::Path;
+use std::{cmp, env};
 
+use anyhow::Context as _;
 use collection::operations::OperationWithClockTag;
 use collection::wal::SerdeWal;
+use storage::content_manager::collection_meta_ops::{
+    CollectionMetaOperations, DeleteCollectionOperation,
+};
 use storage::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use storage::content_manager::consensus_ops::ConsensusOperations;
 use wal::WalOptions;
@@ -18,12 +22,55 @@ fn main() {
     match wal_type {
         "collection" => print_collection_wal(wal_path),
         "consensus" => print_consensus_wal(wal_path),
+        "bullshit" => generate_bullshit(wal_path).unwrap(),
         _ => eprintln!("Unknown wal type: {}", wal_type),
     }
 }
 
+fn generate_bullshit(wal_path: &Path) -> anyhow::Result<()> {
+    let mut wal = ConsensusOpWal::new(wal_path.to_str().context("WAL path is not UTF-8")?);
+
+    if let Some(last_entry) = wal.last_entry()? {
+        if last_entry.index >= 200_000 {
+            log::debug!("last entry index is already {}", last_entry.index);
+            return Ok(());
+        }
+    }
+
+    let last_entry = wal.last_entry()?.unwrap_or_default();
+
+    let term = cmp::max(last_entry.term, 1);
+    let index = last_entry.index + 1;
+
+    let operation = ConsensusOperations::CollectionMeta(
+        CollectionMetaOperations::DeleteCollection(DeleteCollectionOperation("shitfuck".into()))
+            .into(),
+    );
+
+    let data = serde_cbor::to_vec(&operation)?;
+
+    let mut entry = raft::eraftpb::Entry {
+        entry_type: raft::eraftpb::EntryType::EntryNormal as _,
+        term,
+        index,
+        data,
+        context: Vec::new(),
+        sync_log: false,
+    };
+
+    while wal
+        .last_entry()
+        .unwrap()
+        .map_or(false, |entry| entry.index < 200_000)
+    {
+        wal.append_entries(vec![entry.clone()])?;
+        entry.index += 1;
+    }
+
+    Ok(())
+}
+
 fn print_consensus_wal(wal_path: &Path) {
-    // must live within a folder named `collections_meta_wal`
     let wal = ConsensusOpWal::new(wal_path.to_str().unwrap());
     println!("==========================");
     let first_index = wal.first_entry().unwrap();

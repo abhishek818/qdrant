@@ -8,7 +8,9 @@ use std::{fmt, thread};
 use anyhow::{anyhow, Context as _};
 use api::grpc::dynamic_channel_pool::make_grpc_channel;
 use api::grpc::qdrant::raft_client::RaftClient;
-use api::grpc::qdrant::{AllPeers, PeerId as GrpcPeerId, RaftMessage as GrpcRaftMessage};
+use api::grpc::qdrant::{
+    AllPeers, PeerId as GrpcPeerId, RaftMessage as GrpcRaftMessage, RaftMessageBatch,
+};
 use api::grpc::transport_channel_pool::TransportChannelPool;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::shard::PeerId;
@@ -1012,23 +1014,49 @@ impl RaftMessageSender {
         let mut prev_index = 0;
 
         loop {
-            let (index, message) = tokio::select! {
+            let mut batch = Vec::with_capacity(1);
+
+            let index = tokio::select! {
                 biased;
-                Some(message) = self.messages.recv() => message,
-                Ok(()) = self.heartbeat.changed() => self.heartbeat.borrow_and_update().clone(),
+
+                Some(message) = self.messages.recv() => {
+                    let (mut index, message) = message;
+                    batch.push(message);
+
+                    while let Ok(Some(message)) = tokio::time::timeout(Duration::ZERO, self.messages.recv()).await {
+                        let (new_index, message) = message;
+                        batch.push(message);
+
+                        index = new_index;
+
+                        if batch.len() >= 128 {
+                            break;
+                        }
+                    }
+
+                    index
+                }
+
+                Ok(()) = self.heartbeat.changed() => {
+                    let (index, message) = self.heartbeat.borrow_and_update().clone();
+                    batch.push(message);
+                    index
+                }
+
                 else => break,
             };
 
             if prev_index <= index {
-                self.send(&message).await;
+                self.send(&batch).await;
                 prev_index = index;
             }
         }
     }
 
-    async fn send(&mut self, message: &RaftMessage) {
-        if let Err(err) = self.try_send(message).await {
-            let peer_id = message.to;
+    async fn send(&mut self, messages: &[RaftMessage]) {
+        if let Err(err) = self.try_send(messages).await {
+            let message = messages.first();
+            let peer_id = message.map_or(0, |message| message.to);
 
             if log::max_level() >= log::Level::Debug {
                 log::error!("Failed to send Raft message {message:?} to peer {peer_id}: {err}");
@@ -1038,14 +1066,27 @@ impl RaftMessageSender {
         }
     }
 
-    async fn try_send(&mut self, message: &RaftMessage) -> anyhow::Result<()> {
-        let peer_id = message.to;
+    async fn try_send(&mut self, messages: &[RaftMessage]) -> anyhow::Result<()> {
+        let Some(first_message) = messages.first() else {
+            return Ok(());
+        };
 
+        let peer_id = first_message.to;
         let uri = self.uri(peer_id).await?;
 
-        let mut bytes = Vec::new();
-        RaftMessage::encode(message, &mut bytes).context("failed to encode Raft message")?;
-        let grpc_message = GrpcRaftMessage { message: bytes };
+        let mut batch = Vec::with_capacity(messages.len());
+        let mut report_snapshot = false;
+
+        for message in messages {
+            let mut bytes = Vec::new();
+            RaftMessage::encode(message, &mut bytes).context("failed to encode Raft message")?;
+
+            batch.push(bytes);
+
+            if message.msg_type == raft::eraftpb::MessageType::MsgSnapshot as i32 {
+                report_snapshot = true;
+            }
+        }
 
         let timeout = Duration::from_millis(
             self.consensus_config.message_timeout_ticks * self.consensus_config.tick_period_ms,
@@ -1057,16 +1098,18 @@ impl RaftMessageSender {
                 &uri,
                 |channel| async {
                     let mut client = RaftClient::new(channel);
-                    let mut request = tonic::Request::new(grpc_message.clone());
+                    let mut request = tonic::Request::new(RaftMessageBatch {
+                        messages: batch.clone(),
+                    });
                     request.set_timeout(timeout);
-                    client.send(request).await
+                    client.send_batch(request).await
                 },
                 Some(timeout),
                 0,
             )
             .await;
 
-        if message.msg_type == raft::eraftpb::MessageType::MsgSnapshot as i32 {
+        if report_snapshot {
             let res = self.consensus_state.report_snapshot(
                 peer_id,
                 if res.is_ok() {

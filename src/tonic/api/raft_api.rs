@@ -1,6 +1,7 @@
 use api::grpc::qdrant::raft_server::Raft;
 use api::grpc::qdrant::{
-    AddPeerToKnownMessage, AllPeers, Peer, PeerId, RaftMessage as RaftMessageBytes, Uri as UriStr,
+    AddPeerToKnownMessage, AllPeers, Peer, PeerId, RaftMessage as RaftMessageBytes,
+    RaftMessageBatch, Uri as UriStr,
 };
 use itertools::Itertools;
 use raft::eraftpb::Message as RaftMessage;
@@ -38,6 +39,22 @@ impl Raft for RaftService {
             .send(consensus::Message::FromPeer(Box::new(message)))
             .await
             .map_err(|_| Status::internal("Can't send Raft message over channel"))?;
+        Ok(Response::new(()))
+    }
+
+    async fn send_batch(&self, request: Request<RaftMessageBatch>) -> Result<Response<()>, Status> {
+        for message in &request.get_ref().messages {
+            let message =
+                <RaftMessage as prost::Message>::decode(message.as_slice()).map_err(|err| {
+                    Status::invalid_argument(format!("Failed to parse raft message: {err}"))
+                })?;
+
+            self.message_sender
+                .send(consensus::Message::FromPeer(Box::new(message)))
+                .await
+                .map_err(|_| Status::internal("Can't send Raft message over channel"))?;
+        }
+
         Ok(Response::new(()))
     }
 
