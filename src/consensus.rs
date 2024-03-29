@@ -890,7 +890,7 @@ impl RaftMessageBroker {
     }
 
     fn message_sender(&self) -> (RaftMessageSender, RaftMessageSenderHandle) {
-        let (messages_tx, messages_rx) = tokio::sync::mpsc::channel(128);
+        let (messages_tx, messages_rx) = tokio::sync::mpsc::channel(512);
         let (heartbeat_tx, heartbeat_rx) = tokio::sync::watch::channel(Default::default());
 
         let task = RaftMessageSender {
