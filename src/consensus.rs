@@ -452,23 +452,25 @@ impl Consensus {
 
         loop {
             let mut elapsed = previous_tick.elapsed();
+            let mut proposed = 0;
 
             if !self
                 .try_promote_learner()
                 .context("failed to promote learner")?
             {
-                let mut proposed = 0;
                 let mut timeout = tick_period.saturating_sub(elapsed);
 
                 while elapsed < tick_period && proposed < 32 && self.propose_updates(timeout)? {
                     elapsed = previous_tick.elapsed();
-
                     proposed += 1;
+
                     timeout = tick_period / 10;
                 }
+
+                elapsed = previous_tick.elapsed();
             }
 
-            while elapsed > tick_period {
+            while elapsed >= tick_period {
                 self.node.tick();
 
                 previous_tick += tick_period;
@@ -481,7 +483,7 @@ impl Consensus {
                 if stop_consensus {
                     return Ok(());
                 }
-            } else {
+            } else if proposed == 0 {
                 self.try_sync_local_state()?;
             }
         }
